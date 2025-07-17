@@ -11,7 +11,6 @@ import 'package:ml_card_scanner/src/utils/image_processor.dart';
 import 'package:ml_card_scanner/src/utils/stream_debouncer.dart';
 
 class ScannerProcessor {
-
   static const _kDebugOutputCooldownMillis = 5000;
   final bool _usePreprocessingFilters;
   final bool _debugOutputFilteredImage;
@@ -19,6 +18,9 @@ class ScannerProcessor {
     script: TextRecognitionScript.latin,
   );
   StreamController<Uint8List>? _debugImageStreamController;
+
+  // 🔐 Защита от перегрузки памяти
+  bool _isProcessing = false;
 
   ScannerProcessor({
     bool usePreprocessingFilters = false,
@@ -38,90 +40,79 @@ class ScannerProcessor {
       );
 
   Future<CardInfo?> computeImage(
-    ParserAlgorithm parseAlgorithm,
-    CameraImage image,
-    InputImageRotation rotation,
-  ) async {
-    late InputImage inputImage;
-    if (!_usePreprocessingFilters) {
-      final format = InputImageFormatValue.fromRawValue(
-        image.format.raw,
-      );
-      final plane = image.planes.first;
-      final bytes = image.planes.map((e) => e.bytes).toList();
-      inputImage = await compute<List<Uint8List>, InputImage>(
-        (message) async {
-          final bytesAll = Uint8List.fromList(
-            bytes.fold(
-                <int>[],
-                (List<int> previousValue, element) =>
-                    previousValue..addAll(element)),
-          );
-          final input = InputImage.fromBytes(
-            bytes: bytesAll,
-            metadata: InputImageMetadata(
-              size: Size(image.width.toDouble(), image.height.toDouble()),
-              rotation: rotation,
-              format: format ?? InputImageFormat.yuv420,
-              bytesPerRow: plane.bytesPerRow,
-            ),
-          );
-          return input;
-        },
-        bytes,
-      );
-    } else {
-      final rawFormat = image.format.raw;
-      final rawRotation = rotation.rawValue;
-      final Uint8List bytes = Uint8List.fromList(
-        image.planes.fold(
-          <int>[],
-          (List<int> previousValue, element) =>
-              previousValue..addAll(element.bytes),
-        ),
-      );
-      final width = image.width;
-      final height = image.height;
-      final bytesPerRow = image.planes.first.bytesPerRow;
+      ParserAlgorithm parseAlgorithm,
+      CameraImage image,
+      InputImageRotation rotation,
+      ) async {
+    if (_isProcessing) return null;
+    _isProcessing = true;
 
-      ReceivePort? receivePort;
-      if (_debugOutputFilteredImage) {
-        receivePort = ReceivePort();
-        receivePort.listen(
-          (message) {
-            if (message is Uint8List) {
-              if (_debugImageStreamController != null &&
+    try {
+      late InputImage inputImage;
+
+      if (!_usePreprocessingFilters) {
+        final format = InputImageFormatValue.fromRawValue(image.format.raw);
+        final bytes = Uint8List.fromList(
+          image.planes.fold<List<int>>(
+            [],
+                (acc, plane) => acc..addAll(plane.bytes),
+          ),
+        );
+        inputImage = InputImage.fromBytes(
+          bytes: bytes,
+          metadata: InputImageMetadata(
+            size: Size(image.width.toDouble(), image.height.toDouble()),
+            rotation: rotation,
+            format: format ?? InputImageFormat.yuv420,
+            bytesPerRow: image.planes.first.bytesPerRow,
+          ),
+        );
+      } else {
+        final rawFormat = image.format.raw;
+        final rawRotation = rotation.rawValue;
+        final Uint8List bytes = Uint8List.fromList(
+          image.planes.fold<List<int>>(
+            [],
+                (acc, plane) => acc..addAll(plane.bytes),
+          ),
+        );
+
+        ReceivePort? receivePort;
+        if (_debugOutputFilteredImage) {
+          receivePort = ReceivePort();
+          receivePort.listen(
+                (message) {
+              if (message is Uint8List &&
+                  _debugImageStreamController != null &&
                   !_debugImageStreamController!.isClosed) {
                 _debugImageStreamController?.add(message);
               }
-            }
-          },
+            },
+          );
+        }
+
+        inputImage = await createInputImageInIsolate(
+          rawBytes: bytes,
+          width: image.width,
+          height: image.height,
+          rawRotation: rawRotation,
+          rawFormat: rawFormat,
+          bytesPerRow: image.planes.first.bytesPerRow,
+          debugSendPort: receivePort?.sendPort,
         );
+
+        receivePort?.close();
       }
-      inputImage = await createInputImageInIsolate(
-        rawBytes: bytes,
-        width: width,
-        height: height,
-        rawRotation: rawRotation,
-        rawFormat: rawFormat,
-        bytesPerRow: bytesPerRow,
-        debugSendPort: receivePort?.sendPort,
-      );
-      receivePort?.close();
+
+      final recognizedText = await _recognizer.processImage(inputImage);
+      final parsedCard = await parseAlgorithm.parse(recognizedText);
+      return parsedCard;
+    } catch (e, st) {
+      debugPrint('⚠️ computeImage error: $e\n$st');
+      return null;
+    } finally {
+      _isProcessing = false;
     }
-
-    final recognizedText = await _recognizer.processImage(inputImage);
-
-    /*if (kDebugMode) {
-      debugPrint('\nrecognizedText: ${recognizedText.text}\n');
-      for (var e in recognizedText.blocks) {
-        debugPrint('block: -> ${e.text} ');
-      }
-      debugPrint('\n');
-    }*/
-
-    final parsedCard = await parseAlgorithm.parse(recognizedText);
-    return parsedCard;
   }
 
   void dispose() {
